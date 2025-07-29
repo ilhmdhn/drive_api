@@ -5,6 +5,8 @@ require('dotenv').config();
 const masterFileTable = require('../model/master_file');
 const folderId = process.env.DRIVE_FOLDER_ID;
 const crypto = require('crypto');
+const multer = require('multer');
+const splitDir = multer({ dest: 'split/' });
 
 const uploadFile = async (req, res) => {
     const cleanup = () => {
@@ -45,66 +47,66 @@ const uploadFile = async (req, res) => {
             mimeType: req.file.mimetype,
             body: fs.createReadStream(req.file.path),
         };
+        splitFile(req.file.path);
+        // const originalUploadResponse = await drive.files.create({
+        //     resource: originalFileMetadata,
+        //     media: media,
+        //     fields: 'id, name, webContentLink, webViewLink, md5Checksum',
+        // });
 
-        const originalUploadResponse = await drive.files.create({
-            resource: originalFileMetadata,
-            media: media,
-            fields: 'id, name, webContentLink, webViewLink, md5Checksum',
-        });
+        // const originalFileId = originalUploadResponse.data.id;
+        // console.log(`Original file uploaded with ID: ${originalFileId}`);
 
-        const originalFileId = originalUploadResponse.data.id;
-        console.log(`Original file uploaded with ID: ${originalFileId}`);
+        // const driveMd5Hash = originalUploadResponse.data.md5Checksum;
+        // if (localMd5Hash !== driveMd5Hash) {
+        //     console.error(`MD5 mismatch for original file ${originalFileId}! Deleting from Drive.`);
+        //     await drive.files.delete({ fileId: originalFileId });
+        //     cleanup();
+        //     return res.status(500).json({ error: 'Upload failed: File integrity check mismatch.' });
+        // }
 
-        const driveMd5Hash = originalUploadResponse.data.md5Checksum;
-        if (localMd5Hash !== driveMd5Hash) {
-            console.error(`MD5 mismatch for original file ${originalFileId}! Deleting from Drive.`);
-            await drive.files.delete({ fileId: originalFileId });
-            cleanup();
-            return res.status(500).json({ error: 'Upload failed: File integrity check mismatch.' });
-        }
+        // await drive.permissions.create({
+        //     fileId: originalFileId,
+        //     requestBody: { role: 'reader', type: 'anyone' },
+        // });
 
-        await drive.permissions.create({
-            fileId: originalFileId,
-            requestBody: { role: 'reader', type: 'anyone' },
-        });
+        // await masterFileTable.create({
+        //     id_song: songId,
+        //     ext: songExt,
+        //     id_cloud: originalFileId,
+        //     vod: req.body.vod,
+        //     web_content_link: originalUploadResponse.data.webContentLink,
+        //     md5_checksum: localMd5Hash,
+        // });
 
-        await masterFileTable.create({
-            id_song: songId,
-            ext: songExt,
-            id_cloud: originalFileId,
-            vod: req.body.vod,
-            web_content_link: originalUploadResponse.data.webContentLink,
-            md5_checksum: localMd5Hash,
-        });
+        // for (let i = 1; i <= numCopies; i++) {
+        //     const copyMetadata = {
+        //         name: finalFileNameInDrive,
+        //         parents: [folderId],
+        //     };
 
-        for (let i = 1; i <= numCopies; i++) {
-            const copyMetadata = {
-                name: finalFileNameInDrive,
-                parents: [folderId],
-            };
+        //     const copyResponse = await drive.files.copy({
+        //         fileId: originalFileId,
+        //         resource: copyMetadata,
+        //         fields: 'id, name, webContentLink, md5Checksum',
+        //     });
 
-            const copyResponse = await drive.files.copy({
-                fileId: originalFileId,
-                resource: copyMetadata,
-                fields: 'id, name, webContentLink, md5Checksum',
-            });
+        //     const copyId = copyResponse.data.id;
 
-            const copyId = copyResponse.data.id;
+        //     await masterFileTable.create({
+        //         id_song: songId,
+        //         ext: songExt,
+        //         id_cloud: copyId,
+        //         vod: req.body.vod,
+        //         web_content_link: copyResponse.data.webContentLink,
+        //         md5_checksum: localMd5Hash,
+        //     });
 
-            await masterFileTable.create({
-                id_song: songId,
-                ext: songExt,
-                id_cloud: copyId,
-                vod: req.body.vod,
-                web_content_link: copyResponse.data.webContentLink,
-                md5_checksum: localMd5Hash,
-            });
-
-            await drive.permissions.create({
-                fileId: copyId,
-                requestBody: { role: 'reader', type: 'anyone' },
-            });
-        }
+        //     await drive.permissions.create({
+        //         fileId: copyId,
+        //         requestBody: { role: 'reader', type: 'anyone' },
+        //     });
+        // }
 
         console.log('All copies created and made public. Total files available for download:');
         cleanup()
@@ -120,6 +122,55 @@ const uploadFile = async (req, res) => {
         `);
         return res.status(501).json({ error: error.message });
     }
+}
+
+async function splitFile(filePath, chunkSizeMB = 90, outputDir = splitDir) {
+    const fileName = path.basename(filePath);
+    const chunkSize = chunkSizeMB * 1024 * 1024;
+    const readStream = fs.createReadStream(filePath);
+    let partIndex = 1;
+    let currentPartSize = 0;
+    let writeStream = null;
+
+    const manifest = {
+        originalFileName: fileName,
+        totalParts: 0,
+        partPrefix: `${fileName}.part`,
+        parts: [],
+        originalFileSize: (await fs.promises.stat(filePath)).size
+    };
+
+    readStream.on('data', async (chunk) => {
+        if (!writeStream || currentPartSize + chunk.length > chunkSize) {
+            if (writeStream) {
+                writeStream.end(); // Selesaikan writeStream sebelumnya
+                manifest.parts[manifest.parts.length - 1].size = currentPartSize;
+            }
+            // Buat writeStream baru untuk part berikutnya
+            const partFileName = `${outputDir}/${fileName}.part${partIndex}`;
+            writeStream = fs.createWriteStream(partFileName);
+            manifest.parts.push({ number: partIndex, fileName: path.basename(partFileName), size: 0 /* akan diupdate */ });
+            partIndex++;
+            currentPartSize = 0;
+        }
+        writeStream.write(chunk);
+        currentPartSize += chunk.length;
+    });
+
+    readStream.on('end', async () => {
+        if (writeStream) {
+            writeStream.end();
+            manifest.parts[manifest.parts.length - 1].size = currentPartSize;
+        }
+        manifest.totalParts = partIndex - 1;
+        // Tulis file manifest
+        await fs.promises.writeFile(path.join(outputDir, `${fileName}.manifest.json`), JSON.stringify(manifest, null, 2));
+        console.log(`File pecah selesai. ${manifest.totalParts} bagian dibuat.`);
+    });
+
+    readStream.on('error', (err) => {
+        console.error('Error saat membaca file:', err);
+    });
 }
 
 const downloadFile = async (req, res) => {
