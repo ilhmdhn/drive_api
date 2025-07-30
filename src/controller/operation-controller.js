@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 const masterFileTable = require('../model/master_file');
+const masterPartFileTable = require('../model/song_part');
 const folderId = process.env.DRIVE_FOLDER_ID;
 const crypto = require('crypto');
 const multer = require('multer');
@@ -35,19 +36,13 @@ const uploadFile = async (req, res) => {
         const songId = path.parse(originalFileName).name;
         const songExt = path.extname(originalFileName).substring(1);;
         const finalFileNameInDrive = `${songId}.${songExt}`;
-        const numCopies = 5;
+
         const localMd5Hash = await calculateMD5Hash(req.file.path);
 
-        const originalFileMetadata = {
-            name: finalFileNameInDrive,
-            parents: [folderId],
-        };
-
-        const media = {
-            mimeType: req.file.mimetype,
-            body: fs.createReadStream(req.file.path),
-        };
-        splitFile(req.file.path);
+        const listSplitFile = await splitFile(originalFileName, req.file.path);
+        console.log('returnyaa');
+        console.log(listSplitFile);
+        await uploadAndDuplicates(listSplitFile, songId, songExt, localMd5Hash, req.body.vod);
         // const originalUploadResponse = await drive.files.create({
         //     resource: originalFileMetadata,
         //     media: media,
@@ -124,54 +119,117 @@ const uploadFile = async (req, res) => {
     }
 }
 
-async function splitFile(filePath, chunkSizeMB = 90, outputDir = splitDir) {
-    const fileName = path.basename(filePath);
+const uploadAndDuplicates = async (files, songId, ext, hash, vod) => {
+    try {
+        for (const file of files) {
+
+            console.log('split' + file)
+            const filePath = path.join('split', file.fileName)
+
+            const media = {
+                mimeType: 'application/octet-stream',
+                body: fs.createReadStream(filePath),
+            };
+            const originalFileMetadata = {
+                name: file.fileName,
+                parents: [folderId],
+            };
+            const originalUploadResponse = await drive.files.create({
+                resource: originalFileMetadata,
+                media: media,
+                fields: 'id, name, webContentLink'
+            });
+
+            const originalFileId = originalUploadResponse.data.id;
+            await drive.permissions.create({
+                fileId: originalFileId,
+                requestBody: { role: 'reader', type: 'anyone' },
+            });
+
+            await masterPartFileTable.create({
+                reference_files: `${songId}-0`,
+                file_id: originalFileId,
+                filename: file.fileName,
+                number: file.number
+            });
+        }
+
+        await masterFileTable.create({
+            id_song: songId,
+            ext: ext,
+            reference_files: `${songId}-0`,
+            vod: vod,
+            md5_checksum: hash
+        });
+        duplicateFile(`${songId}-0`);
+    } catch (error) {
+        throw `Gagal upload master file ${error} ${error.stack}`;
+    }
+}
+
+
+const duplicateFile = async (idReferences) => {
+    try {
+        const master = await masterFileTable.findOne({
+            where: {
+                reference_files: idReferences
+            },
+            raw: true
+        });
+
+        console.log(master);
+
+    } catch (error) {
+        console.error('asdmaow' + error.message);
+    }
+}
+
+async function splitFile(fileName, filePath, chunkSizeMB = 90, outputDir = 'split') {
     const chunkSize = chunkSizeMB * 1024 * 1024;
+
+    await fs.promises.mkdir(outputDir, { recursive: true });
+
     const readStream = fs.createReadStream(filePath);
     let partIndex = 1;
     let currentPartSize = 0;
     let writeStream = null;
 
-    const manifest = {
-        originalFileName: fileName,
-        totalParts: 0,
-        partPrefix: `${fileName}.part`,
-        parts: [],
-        originalFileSize: (await fs.promises.stat(filePath)).size
-    };
+    const result = [];
 
-    readStream.on('data', async (chunk) => {
-        if (!writeStream || currentPartSize + chunk.length > chunkSize) {
-            if (writeStream) {
-                writeStream.end(); // Selesaikan writeStream sebelumnya
-                manifest.parts[manifest.parts.length - 1].size = currentPartSize;
+    return new Promise((resolve, reject) => {
+        readStream.on('data', (chunk) => {
+            if (!writeStream || currentPartSize + chunk.length > chunkSize) {
+                if (writeStream) {
+                    writeStream.end();
+                }
+
+                const partFileName = `${fileName}.part${partIndex}`;
+                const partFilePath = path.join(outputDir, partFileName);
+
+                writeStream = fs.createWriteStream(partFilePath);
+                result.push({ fileName: partFileName, number: partIndex });
+                partIndex++;
+                currentPartSize = 0;
             }
-            // Buat writeStream baru untuk part berikutnya
-            const partFileName = `${outputDir}/${fileName}.part${partIndex}`;
-            writeStream = fs.createWriteStream(partFileName);
-            manifest.parts.push({ number: partIndex, fileName: path.basename(partFileName), size: 0 /* akan diupdate */ });
-            partIndex++;
-            currentPartSize = 0;
-        }
-        writeStream.write(chunk);
-        currentPartSize += chunk.length;
-    });
 
-    readStream.on('end', async () => {
-        if (writeStream) {
-            writeStream.end();
-            manifest.parts[manifest.parts.length - 1].size = currentPartSize;
-        }
-        manifest.totalParts = partIndex - 1;
-        // Tulis file manifest
-        await fs.promises.writeFile(path.join(outputDir, `${fileName}.manifest.json`), JSON.stringify(manifest, null, 2));
-        console.log(`File pecah selesai. ${manifest.totalParts} bagian dibuat.`);
-    });
+            writeStream.write(chunk);
+            currentPartSize += chunk.length;
+        });
 
-    readStream.on('error', (err) => {
-        console.error('Error saat membaca file:', err);
+        readStream.on('end', () => {
+            if (writeStream) {
+                writeStream.end();
+            }
+            resolve(result);
+        });
+
+        readStream.on('error', (err) => {
+            console.error('Error saat membaca file:', err);
+            reject(err);
+        });
     });
 }
+
 
 const downloadFile = async (req, res) => {
     try {
