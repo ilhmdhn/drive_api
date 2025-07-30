@@ -5,6 +5,9 @@ const app = express();
 const port = process.env.SERVER_PORT;
 
 const operationRouter = require('./src/router/operation-router');
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 
 app.use('/song', operationRouter);
 
